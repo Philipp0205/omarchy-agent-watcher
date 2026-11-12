@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.5d0tal1gat0r.agent-watcher",
   "name": "Agent Watcher",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "5d0tal1gat0r",
   "license": "MIT",
   "description": "Every Claude Code, Codex, Gemini CLI and OpenCode session across your workspaces in one bar pill — it blinks when an agent finishes or waits for you.",
