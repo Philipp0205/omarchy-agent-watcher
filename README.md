@@ -87,6 +87,22 @@ window titles and focus from Hyprland. Sessions vanish on `SessionEnd`, when
 their process is gone, or when their terminal window is closed (re-checked
 whenever a window appears or disappears, and every 15 s). Nothing leaves your machine.
 
+Codex 0.16x runs every session's hooks inside one shared `codex app-server`
+daemon, so the parent chain leads to whichever terminal started the daemon.
+For those sessions the hook looks for the Codex TUI instead: the one started
+in the session's directory, the focused one when several qualify, or the one
+not already showing another session. Codex sends no `SessionEnd` when a TUI
+quits, so the session is tied to the TUI process and disappears with it.
+
+Some state changes come without any hook: pressing Esc, denying a
+permission, approving one (the hook only reports back once the tool has
+finished), an API error. The shell then trusts the agent's own window title
+when it has disagreed with the hook state for a few seconds — Claude Code
+shows a spinning `◐` while working and `✳` otherwise, Codex a braille spinner
+and `[ ! ] Action Required`, Gemini CLI `◇ Ready` and `✋ Action Required` —
+and Claude Code's transcript records a denied permission right away. The
+next real hook event takes over again.
+
 Hyprland ≥ 0.56 dispatches through a Lua API, so the plugin sends both the Lua
 (`hl.dsp.focus{window=…}`) and the classic (`focuswindow`) form when focusing
 a window — click-to-focus works on both generations.
@@ -100,6 +116,15 @@ a window — click-to-focus works on both generations.
   **Other**, without click-to-focus. An agent that outlives its closed
   terminal (OpenCode ignores the hangup) is dropped from the list within a
   second — the process itself keeps running until you kill it.
+- Codex sessions appear with their first prompt (that is when Codex fires
+  `SessionStart`). Two Codex TUIs started in the same directory are told apart
+  by focus; until you type in one, a new session there is listed without a
+  window.
+- OpenCode 2.x (the `opencode serve` / service generation) uses a new plugin
+  API and is not supported yet; OpenCode 1.x is.
+- OpenCode sessions keep their own name only once OpenCode has generated one;
+  until then (and for short sessions it never does) the project folder is
+  shown.
 - Sub-agent sessions (Claude Code subagents, OpenCode child sessions) and
   Claude Code's own background plumbing (the `claude daemon` and the
   `bg-pty-host` sessions it pre-spawns) are intentionally not listed — only
@@ -112,5 +137,7 @@ node --test test/model.test.js
 bash test/hook.test.sh
 omarchy plugin validate .
 ```
+
+Changes per release: [CHANGELOG.md](CHANGELOG.md).
 
 MIT — see LICENSE.

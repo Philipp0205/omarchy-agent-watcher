@@ -54,7 +54,8 @@ test("normalizeSession: valid file becomes a session with shell-side defaults", 
   assert.deepEqual(s, {
     key: "claude-abc", agent: "claude", sessionId: "abc", state: "done", cwd: "/home/u/proj",
     agentPid: 4242, windowAddress: "abc", updatedAt: 1755500000, lastEvent: "done",
-    title: "", seen: false, stateSince: 0
+    title: "", seen: false, stateSince: 0,
+    titleBusySeen: false, titleWaitSeen: false, titlePending: "", titleSince: 0, titleOverride: ""
   })
 })
 
@@ -335,6 +336,141 @@ test("groupByWorkspace: groups by the live window's workspace, Other last, curre
   ])
   assert.deepEqual(Model.groupByWorkspace([], lookup, 1, {}), [])
   assert.equal(Model.groupByWorkspace(list.slice(0, 1), null, 1, {})[0].label, "Other")
+})
+
+// ---- Window titles as a liveness signal
+
+test("titleActivity: per-agent busy/idle markers, unknown otherwise", () => {
+  assert.equal(Model.titleActivity("claude", "◐ Fix the bug"), "busy")
+  assert.equal(Model.titleActivity("claude", "◓ Fix the bug"), "busy")
+  assert.equal(Model.titleActivity("claude", "✳ Fix the bug"), "idle")
+  assert.equal(Model.titleActivity("claude", "Fix the bug"), "")
+  assert.equal(Model.titleActivity("claude", ""), "")
+  assert.equal(Model.titleActivity("codex", "⠋ proj-beta"), "busy")
+  assert.equal(Model.titleActivity("codex", "Reply with pong | proj-beta"), "idle")
+  assert.equal(Model.titleActivity("codex", ""), "")
+  assert.equal(Model.titleActivity("codex", "[ ! ] Action Required | Create marker.txt | proj"), "waiting")
+  assert.equal(Model.titleActivity("codex", "[ . ] Action Required | Create marker.txt | proj"), "waiting")
+  assert.equal(Model.titleActivity("gemini", "\u270B  Action Required (proj)"), "waiting")
+  assert.equal(Model.titleActivity("gemini", "◇  Ready (proj)"), "idle")
+  assert.equal(Model.titleActivity("gemini", "✦  Working… (proj)"), "")
+  assert.equal(Model.titleActivity("opencode", "OpenCode"), "")
+  assert.equal(Model.titleActivity("aider", "✳ x"), "")
+})
+
+function working(over) {
+  return Model.mergeSessions({}, snap([F(Object.assign({ state: "working", lastEvent: "prompt", updatedAt: 100 }, over))]), "", 100)
+}
+
+test("reconcileTitles: an interrupted Claude turn reads as idle after the grace period", () => {
+  let m = working()
+  m = Model.reconcileTitles(m, { aaa: "◐ Task" }, 101)
+  assert.equal(Model.displayState(m["claude-s1"]), "working")
+  m = Model.reconcileTitles(m, { aaa: "✳ Task" }, 102)
+  assert.equal(Model.displayState(m["claude-s1"]), "working", "not before the grace period")
+  m = Model.reconcileTitles(m, { aaa: "✳ Task" }, 102 + Model.TITLE_GRACE_SEC)
+  assert.equal(m["claude-s1"].titleOverride, "idle")
+  assert.equal(Model.displayState(m["claude-s1"]), "idle")
+  assert.equal(Model.barSummary(Model.sessionList(m), {}).working, 0, "an interrupted turn is not counted as working")
+  m = Model.reconcileTitles(m, { aaa: "◑ Task" }, 120)
+  assert.equal(Model.displayState(m["claude-s1"]), "working", "busy again (e.g. queued input) -> working")
+})
+
+test("reconcileTitles: a fresh prompt is not marked idle while the title catches up", () => {
+  let m = working({ updatedAt: 100 })
+  m = Model.reconcileTitles(m, { aaa: "✳ Task" }, 100)
+  m = Model.reconcileTitles(m, { aaa: "✳ Task" }, 100 + Model.TITLE_GRACE_SEC - 1)
+  assert.equal(m["claude-s1"].titleOverride, "")
+})
+
+test("reconcileTitles: Codex needs to have shown its spinner before an idle title counts", () => {
+  let m = working({ agent: "codex" })
+  m = Model.reconcileTitles(m, { aaa: "proj | thread" }, 120)
+  m = Model.reconcileTitles(m, { aaa: "proj | thread" }, 130)
+  assert.equal(m["codex-s1"].titleOverride, "", "a title the agent may not control proves nothing")
+  m = Model.reconcileTitles(m, { aaa: "⠹ proj" }, 131)
+  m = Model.reconcileTitles(m, { aaa: "proj | thread" }, 132)
+  m = Model.reconcileTitles(m, { aaa: "proj | thread" }, 132 + Model.TITLE_GRACE_SEC)
+  assert.equal(m["codex-s1"].titleOverride, "idle")
+})
+
+test("reconcileTitles: Claude's waiting title is its idle glyph, so waiting is never ended by it; same map when nothing changes", () => {
+  let m = Model.mergeSessions({}, snap([F({ state: "waiting", updatedAt: 100 }), F({ sessionId: "s2", state: "working", windowAddress: "" })]), "", 100)
+  const m2 = Model.reconcileTitles(m, { aaa: "✳ Task" }, 200)
+  assert.equal(m2["claude-s1"].titleOverride, "", "waiting shows the idle glyph too")
+  assert.equal(m2["claude-s2"].titleOverride, "", "no window, no opinion")
+  assert.equal(m2, m, "nothing changed -> same object")
+  assert.equal(Model.needsAttention(m2["claude-s1"], {}), true)
+})
+
+test("reconcileTitles: an approved permission reads as working while the tool runs", () => {
+  let m = Model.mergeSessions({}, snap([F({ state: "waiting", lastEvent: "waiting", updatedAt: 100 })]), "", 100)
+  m = Model.reconcileTitles(m, { aaa: "◐ Task" }, 110)
+  m = Model.reconcileTitles(m, { aaa: "◑ Task" }, 110 + Model.TITLE_GRACE_SEC)
+  assert.equal(Model.displayState(m["claude-s1"]), "working")
+  assert.equal(Model.needsAttention(m["claude-s1"], {}), false, "no yellow blink once approved")
+  const sum = Model.barSummary(Model.sessionList(m), {})
+  assert.equal(sum.working, 1)
+  assert.equal(sum.waiting, 0)
+})
+
+test("reconcileTitles: a denied Codex approval reads as idle once its Action Required title is gone", () => {
+  let m = Model.mergeSessions({}, snap([F({ agent: "codex", state: "waiting", lastEvent: "waiting", updatedAt: 100 })]), "", 100)
+  m = Model.reconcileTitles(m, { aaa: "Create marker | proj" }, 110)
+  m = Model.reconcileTitles(m, { aaa: "Create marker | proj" }, 120)
+  assert.equal(Model.displayState(m["codex-s1"]), "waiting", "never saw the waiting marker: no opinion")
+  m = Model.reconcileTitles(m, { aaa: "[ ! ] Action Required | Create marker | proj" }, 121)
+  assert.equal(Model.displayState(m["codex-s1"]), "waiting")
+  m = Model.reconcileTitles(m, { aaa: "Create marker | proj" }, 122)
+  m = Model.reconcileTitles(m, { aaa: "Create marker | proj" }, 122 + Model.TITLE_GRACE_SEC)
+  assert.equal(Model.displayState(m["codex-s1"]), "idle")
+  assert.equal(Model.barSummary(Model.sessionList(m), {}).attention, 0)
+})
+
+test("reconcileTitles: the pending override restarts when the title changes its mind", () => {
+  let m = working()
+  m = Model.reconcileTitles(m, { aaa: "✳ Task" }, 110)
+  m = Model.reconcileTitles(m, { aaa: "◐ Task" }, 112)
+  m = Model.reconcileTitles(m, { aaa: "✳ Task" }, 113)
+  m = Model.reconcileTitles(m, { aaa: "✳ Task" }, 110 + Model.TITLE_GRACE_SEC)
+  assert.equal(m["claude-s1"].titleOverride, "", "the grace period counts from the last flip")
+  m = Model.reconcileTitles(m, { aaa: "✳ Task" }, 113 + Model.TITLE_GRACE_SEC)
+  assert.equal(m["claude-s1"].titleOverride, "idle")
+})
+
+test("mergeSessions: the title bookkeeping survives an unchanged event and resets on a new one", () => {
+  let m = working()
+  m = Model.reconcileTitles(m, { aaa: "✳ Task" }, 101)
+  m = Model.reconcileTitles(m, { aaa: "✳ Task" }, 101 + Model.TITLE_GRACE_SEC)
+  assert.equal(m["claude-s1"].titleOverride, "idle")
+  m = Model.mergeSessions(m, snap([F({ state: "working", lastEvent: "prompt", updatedAt: 100 })]), "", 200)
+  assert.equal(m["claude-s1"].titleOverride, "idle", "same event: override kept")
+  m = Model.mergeSessions(m, snap([F({ state: "working", lastEvent: "prompt", updatedAt: 210 })]), "", 210)
+  assert.equal(m["claude-s1"].titleOverride, "", "new prompt: fresh")
+})
+
+test("sessionLabel: OpenCode's placeholder session names fall back to the window/project", () => {
+  const s = Model.normalizeSession({ agent: "opencode", sessionId: "o", state: "idle", cwd: "/w/proj", title: "New session - 2026-11-12T22:14:40.307Z" })
+  assert.equal(Model.sessionLabel(s, "OpenCode", "/home/u"), "proj")
+  const c = Model.normalizeSession({ agent: "opencode", sessionId: "o", state: "idle", cwd: "/w/proj", title: "Child session - 2026-11-12T22:14:40.307Z" })
+  assert.equal(Model.sessionLabel(c, "", "/home/u"), "proj")
+  const n = Model.normalizeSession({ agent: "opencode", sessionId: "o", state: "idle", cwd: "/w/proj", title: "New session handling" })
+  assert.equal(Model.sessionLabel(n, "", "/home/u"), "New session handling")
+})
+
+test("sessionLabel: Codex's ' | <project>' title suffix is dropped", () => {
+  const s = Model.normalizeSession({ agent: "codex", sessionId: "c", state: "done", cwd: "/w/proj-beta" })
+  assert.equal(Model.sessionLabel(s, "Reply with pong | proj-beta", "/home/u"), "Reply with pong")
+  assert.equal(Model.sessionLabel(s, "\u280B proj-beta", "/home/u"), "proj-beta")
+  assert.equal(Model.sessionLabel(s, "a | b", "/home/u"), "a | b")
+})
+
+test("sessionLabel: status-only titles do not become row names", () => {
+  const g = Model.normalizeSession({ agent: "gemini", sessionId: "g", state: "idle", cwd: "/w/proj-gamma" })
+  assert.equal(Model.sessionLabel(g, "\u25C7  Ready (proj-gamma)", "/home/u"), "proj-gamma")
+  assert.equal(Model.sessionLabel(g, "\u270B  Action Required (proj-gamma)", "/home/u"), "proj-gamma")
+  const c = Model.normalizeSession({ agent: "codex", sessionId: "c", state: "waiting", cwd: "/w/proj-gamma" })
+  assert.equal(Model.sessionLabel(c, "[ ! ] Action Required | Create marker.txt | proj-gamma", "/home/u"), "Create marker.txt")
 })
 
 test("parseHookStatus / hookStatusLabel", () => {

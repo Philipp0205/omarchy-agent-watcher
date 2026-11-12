@@ -11,13 +11,19 @@ export HOME="$TMP/home"
 mkdir -p "$HOME" "$TMP/bin" "$TMP/emptybin"
 
 # Stubs on PATH: hyprctl reports one window owned by THIS test process (an
-# ancestor of every hook run below); omarchy-shell just logs. Setting
+# ancestor of every hook run below), or $HYPRCTL_CLIENTS when set; the active
+# window is whatever $TMP/active holds (a file, so long-lived fake agents
+# started earlier see changes); omarchy-shell just logs. Setting
 # HYPRCTL_STUB_EMPTY=1 makes hyprctl report no windows at all, so tests can
 # exercise the unresolved-window path.
 cat > "$TMP/bin/hyprctl" <<EOF
 #!/usr/bin/env bash
 echo "\$*" >> "$TMP/hyprctl.log"
-if [ "\${HYPRCTL_STUB_EMPTY:-0}" = 1 ]; then
+if [ "\$1" = activewindow ]; then
+  echo "{\\"address\\": \\"\$(cat "$TMP/active" 2>/dev/null)\\"}"
+elif [ -n "\${HYPRCTL_CLIENTS:-}" ]; then
+  echo "\$HYPRCTL_CLIENTS"
+elif [ "\${HYPRCTL_STUB_EMPTY:-0}" = 1 ]; then
   echo '[]'
 else
   echo '[{"pid": $$, "address": "0xABC123"}]'
@@ -279,6 +285,143 @@ assert_nofile "$AGENT_WATCHER_STATE_DIR/claude-bg1.json" "helper-spawned session
 run_agent claude session-start '{"session_id":"n1","cwd":"/tmp/x"}' >/dev/null
 assert_file "$AGENT_WATCHER_STATE_DIR/claude-n1.json" "normal session still tracked"
 assert_eq "$(field "$AGENT_WATCHER_STATE_DIR/claude-n1.json" .windowAddress)" abc123 "normal session still resolves its window with the full walk"
+
+# ---- long-lived fake agents: one process that runs several hook events, the
+# way a real agent does (the PPID walk must find the *same* pid every time).
+start_agent() { # start_agent <name> <argv0> <cwd>  -> sets SRV_PID
+  local fifo="$TMP/$1.fifo"
+  rm -f "$fifo" "$TMP/$1.ack"; mkfifo "$fifo"; : > "$TMP/$1.ack"
+  # The hook path travels in the environment: an ancestor whose cmdline
+  # mentions agent-watcher-hook is skipped by the walk.
+  ( cd "$3" && HOOKP="$HOOK" FIFO="$fifo" ACK="$TMP/$1.ack" AGENT_NAME="${2%% *}" exec -a "$2" bash -c \
+      'exec 3<>"$FIFO"; while read -r ev json <&3; do printf "%s" "$json" | "$HOOKP" "$AGENT_NAME" "$ev"; echo ok >> "$ACK"; done' ) &
+  SRV_PID=$!
+  sleep 0.2
+}
+send_agent() { # send_agent <name> <event> <json>: run one hook inside <name>, wait for it
+  local before i
+  before=$(wc -l < "$TMP/$1.ack")
+  printf '%s %s\n' "$2" "$3" > "$TMP/$1.fifo"
+  for i in $(seq 1 100); do [ "$(wc -l < "$TMP/$1.ack")" -gt "$before" ] && return 0; sleep 0.05; done
+  ko "send_agent $1 $2 timed out"
+}
+start_tui() { # start_tui <argv0> <cwd> -> sets TUI_PID (a client that never runs hooks)
+  ( cd "$2" && exec -a "$1" sleep 300 ) &
+  TUI_PID=$!
+  sleep 0.1
+}
+
+echo "== hook: SessionStart again in the same process (compact / resume)"
+reset_logs
+mkdir -p "$TMP/w/same"
+start_agent cl1 claude "$TMP/w/same"; CL1=$SRV_PID
+F="$AGENT_WATCHER_STATE_DIR/claude-k1.json"
+send_agent cl1 session-start '{"session_id":"k1","cwd":"/tmp/k"}'
+send_agent cl1 prompt '{"session_id":"k1","cwd":"/tmp/k"}'
+assert_eq "$(field "$F" .agentPid)" "$CL1" "long-lived fake agent resolved"
+ts=$(field "$F" .updatedAt)
+send_agent cl1 session-start '{"session_id":"k1","cwd":"/tmp/k","source":"compact"}'
+assert_eq "$(field "$F" .state)" working "a repeated SessionStart (compaction) keeps the working state"
+assert_eq "$(field "$F" .lastEvent)" prompt "a repeated SessionStart leaves lastEvent alone"
+assert_eq "$(field "$F" .updatedAt)" "$ts" "a repeated SessionStart leaves updatedAt alone (no blink re-arm)"
+
+echo "== hook: a new session in the same process replaces the old one (/clear, /new)"
+send_agent cl1 done '{"session_id":"k1","cwd":"/tmp/k"}'
+send_agent cl1 session-start '{"session_id":"k2","cwd":"/tmp/k","source":"clear"}'
+assert_nofile "$F" "the previous session of that process is dropped"
+assert_file "$AGENT_WATCHER_STATE_DIR/claude-k2.json" "the new session is tracked"
+assert_eq "$(field "$AGENT_WATCHER_STATE_DIR/claude-k2.json" .state)" idle "the new session starts idle"
+run_agent claude session-start '{"session_id":"k3","cwd":"/tmp/k"}' >/dev/null
+assert_file "$AGENT_WATCHER_STATE_DIR/claude-k2.json" "a session of another process is left alone"
+kill "$CL1" 2>/dev/null; wait "$CL1" 2>/dev/null
+mkdir -p "$AGENT_WATCHER_STATE_DIR"
+start_agent oc1 opencode "$TMP/w/same"; OC1=$SRV_PID
+send_agent oc1 session-start '{"session_id":"oa","cwd":"/tmp/k"}'
+send_agent oc1 session-start '{"session_id":"ob","cwd":"/tmp/k"}'
+assert_file "$AGENT_WATCHER_STATE_DIR/opencode-oa.json" "OpenCode keeps sibling sessions of one process"
+kill "$OC1" 2>/dev/null; wait "$OC1" 2>/dev/null
+
+echo "== hook: sessions served by a shared daemon (codex app-server)"
+reset_logs
+mkdir -p "$TMP/w/pa" "$TMP/w/pb"
+start_tui codex "$TMP/w/pa"; T1=$TUI_PID
+start_tui codex "$TMP/w/pb"; T2=$TUI_PID
+start_tui codex "$TMP/w/pa"; T3=$TUI_PID
+export HYPRCTL_CLIENTS="[{\"pid\": $$, \"address\": \"0xABC123\"}, {\"pid\": $T1, \"address\": \"0x111\"}, {\"pid\": $T2, \"address\": \"0x222\"}, {\"pid\": $T3, \"address\": \"0x333\"}]"
+start_agent daemon "codex app-server" "$TMP/w"; DAEMON=$SRV_PID
+send_agent daemon session-start "{\"session_id\":\"x1\",\"cwd\":\"$TMP/w/pb\"}"
+X="$AGENT_WATCHER_STATE_DIR/codex-x1.json"
+assert_eq "$(field "$X" .agentPid)" "$T2" "daemon session bound to the only TUI started in its directory"
+assert_eq "$(field "$X" .windowAddress)" 222 "...and to that TUI's window, not the daemon's"
+send_agent daemon prompt "{\"session_id\":\"x1\",\"cwd\":\"$TMP/w/pb\"}"
+assert_eq "$(field "$X" .agentPid)" "$T2" "binding kept on later events"
+assert_eq "$(field "$X" .state)" working "later events still update the state"
+echo 0x333 > "$TMP/active"
+send_agent daemon session-start "{\"session_id\":\"x2\",\"cwd\":\"$TMP/w/pa\"}"
+assert_eq "$(field "$AGENT_WATCHER_STATE_DIR/codex-x2.json" .windowAddress)" 333 "two TUIs in one directory: the focused one wins"
+rm -f "$TMP/active"
+send_agent daemon session-start "{\"session_id\":\"x3\",\"cwd\":\"$TMP/w/pa\"}"
+assert_eq "$(field "$AGENT_WATCHER_STATE_DIR/codex-x3.json" .agentPid)" "$T1" "no focus: the TUI not bound to another session wins"
+start_tui codex "$TMP/w/pa"; T4=$TUI_PID
+send_agent daemon session-start "{\"session_id\":\"x4\",\"cwd\":\"$TMP/w/pa\"}"
+send_agent daemon session-start "{\"session_id\":\"x5\",\"cwd\":\"$TMP/w/pa\"}"
+X5="$AGENT_WATCHER_STATE_DIR/codex-x5.json"
+assert_eq "$(field "$X5" .windowAddress)" "" "ambiguous: no window rather than a wrong one"
+assert_eq "$(field "$X5" .agentPid)" "$DAEMON" "ambiguous: the daemon's pid keeps it alive"
+echo 0x111 > "$TMP/active"
+send_agent daemon prompt "{\"session_id\":\"x5\",\"cwd\":\"$TMP/w/pa\"}"
+assert_eq "$(field "$X5" .agentPid)" "$T1" "an undecided session binds on a later event typed in a focused TUI"
+send_agent daemon session-start "{\"session_id\":\"x6\",\"cwd\":\"$TMP/w/pa\"}"
+assert_nofile "$AGENT_WATCHER_STATE_DIR/codex-x3.json" "/new in a TUI drops that TUI's previous session"
+assert_nofile "$X5" "...every previous session of that TUI"
+assert_file "$AGENT_WATCHER_STATE_DIR/codex-x2.json" "...and leaves the other TUIs' sessions alone"
+rm -f "$TMP/active"
+kill "$T2" 2>/dev/null; wait "$T2" 2>/dev/null
+"$HOOK" dump >/dev/null
+assert_nofile "$X" "a daemon session is pruned once its TUI exits (Codex sends no SessionEnd)"
+assert_file "$AGENT_WATCHER_STATE_DIR/codex-x2.json" "other daemon sessions survive"
+kill "$DAEMON" "$T1" "$T3" "$T4" 2>/dev/null; wait 2>/dev/null
+unset HYPRCTL_CLIENTS
+
+echo "== hook: turns that end without a hook (denied permission, Esc)"
+reset_logs
+mkdir -p "$TMP/w/tr"
+start_agent cl2 claude "$TMP/w/tr"; CL2=$SRV_PID
+TR="$TMP/w/tr/session.jsonl"
+iso() { date -u -d "@$1" +%Y-%m-%dT%H:%M:%S.123Z; }
+now=$(date +%s)
+printf '{"type":"user","timestamp":"%s","message":{"role":"user","content":"do it"}}\n' "$(iso $((now-5)))" > "$TR"
+send_agent cl2 session-start "{\"session_id\":\"r1\",\"cwd\":\"/tmp/r\",\"transcript_path\":\"$TR\"}"
+send_agent cl2 waiting "{\"session_id\":\"r1\",\"cwd\":\"/tmp/r\"}"
+assert_eq "$(field "$AGENT_WATCHER_STATE_DIR/claude-r1.json" .transcriptPath)" "$TR" "transcript path stored and kept"
+assert_eq "$("$HOOK" dump | jq -r '.[0].state')" waiting "still waiting while the transcript shows no end of turn"
+wts=$(field "$AGENT_WATCHER_STATE_DIR/claude-r1.json" .updatedAt)
+{ printf '{"type":"user","timestamp":"%s","message":{"role":"user","content":[{"type":"tool_result","content":"rejected"}]}}\n' "$(iso $((wts+1)))"
+  printf '{"type":"user","timestamp":"%s","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}}\n' "$(iso $((wts+1)))"
+  printf '{"type":"permission-mode","permissionMode":"default"}\n'; } >> "$TR"
+dump=$("$HOOK" dump)
+assert_eq "$(printf '%s' "$dump" | jq -r '.[0].state + " " + .[0].lastEvent')" "idle interrupted" "a denied permission reads as idle"
+assert_eq "$(field "$AGENT_WATCHER_STATE_DIR/claude-r1.json" .state)" waiting "the dump does not rewrite the state file"
+sleep 2.1
+send_agent cl2 prompt "{\"session_id\":\"r1\",\"cwd\":\"/tmp/r\"}"
+assert_eq "$("$HOOK" dump | jq -r '.[0].state')" working "a newer hook event wins over an older end of turn"
+printf '{"type":"system","subtype":"turn_duration","timestamp":"%s","durationMs":10}\n' "$(iso $(( $(date +%s) + 1 )))" >> "$TR"
+assert_eq "$("$HOOK" dump | jq -r '.[0].state')" idle "a closing turn_duration record ends a working turn too"
+printf '{"type":"assistant","timestamp":"%s","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}\n{"type":"user", "broken' "$(iso $(( $(date +%s) + 2 )))" >> "$TR"
+assert_eq "$("$HOOK" dump | jq -r '.[0].state')" working "a later message (and a half-written line) means the turn goes on"
+send_agent cl2 done "{\"session_id\":\"r1\",\"cwd\":\"/tmp/r\"}"
+printf '\n{"type":"system","subtype":"turn_duration","timestamp":"%s"}\n' "$(iso $(( $(date +%s) + 1 )))" >> "$TR"
+assert_eq "$("$HOOK" dump | jq -r '.[0].state')" done "done is never rewritten"
+rm -f "$TR"
+send_agent cl2 prompt "{\"session_id\":\"r1\",\"cwd\":\"/tmp/r\"}"
+assert_eq "$("$HOOK" dump | jq -r '.[0].state')" working "a missing transcript changes nothing"
+kill "$CL2" 2>/dev/null; wait "$CL2" 2>/dev/null
+
+echo "== hook: titles with line breaks do not shift the other fields"
+reset_logs
+run_agent opencode session-start '{"session_id":"nl","cwd":"/tmp/x","title":"two\nlines"}' >/dev/null
+run_agent opencode prompt '{"session_id":"nl"}' >/dev/null
+assert_eq "$(field "$AGENT_WATCHER_STATE_DIR/opencode-nl.json" .cwd)" /tmp/x "cwd survives a multi-line title"
 
 echo "== setup: claude merge / idempotence / remove"
 export AGENT_WATCHER_CLAUDE_SETTINGS="$TMP/cfg/claude/settings.json"

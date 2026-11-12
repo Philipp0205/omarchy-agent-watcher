@@ -28,6 +28,15 @@ BarWidget {
   readonly property string hookScript: Model.pathFromUrl(Qt.resolvedUrl("bin/agent-watcher-hook"))
   readonly property string setupScript: Model.pathFromUrl(Qt.resolvedUrl("bin/agent-watcher-setup"))
   property bool dumpPending: false
+  // True while some session is working or waiting: only then are window
+  // titles polled (see reconcileTitles in Model.js).
+  readonly property bool anyActive: {
+    for (var i = 0; i < sessionList.length; i++) {
+      var st = sessionList[i].state
+      if (st === "working" || st === "waiting") return true
+    }
+    return false
+  }
 
   // ---- Colors: theme palette (colors.toml) with fallbacks.
   property string themeGreen: ""
@@ -65,6 +74,20 @@ BarWidget {
     if (!res.ok) return
     var now = Math.floor(Date.now() / 1000)
     sessions = Model.mergeSessions(sessions, res.sessions, activeAddress(), now)
+    reconcileTitles()
+  }
+
+  // A turn can change state without any hook (Esc, a denied or an approved
+  // permission, an API error); the agent's own window title still tells.
+  function reconcileTitles() {
+    var titles = {}
+    var values = Hyprland.toplevels.values
+    for (var i = 0; i < values.length; i++) {
+      var addr = Model.normalizeAddress(values[i].address)
+      if (addr !== "") titles[addr] = values[i].title || ""
+    }
+    var next = Model.reconcileTitles(sessions, titles, Math.floor(Date.now() / 1000))
+    if (next !== sessions) sessions = next
   }
 
   function acknowledgeFocused() {
@@ -183,6 +206,13 @@ BarWidget {
         }
       }
     }
+  }
+
+  Timer {
+    interval: 1000
+    running: root.anyActive
+    repeat: true
+    onTriggered: root.reconcileTitles()
   }
 
   // Liveness: prune dead agents even when no hook ever fires again.

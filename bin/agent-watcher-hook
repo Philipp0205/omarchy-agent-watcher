@@ -39,6 +39,24 @@ helper_pattern() { # ERE matched against an ancestor's cmdline; empty = none
   esac
 }
 
+# Shared background servers that run the hooks on behalf of several frontends
+# (Codex >= 0.16x starts one `codex app-server` daemon from the first TUI and
+# every later TUI talks to it). The parent chain of a hook fired from inside
+# one leads to whichever TUI spawned the daemon, not to the session's own
+# terminal, so the frontend has to be found another way (see resolve_client).
+hosted_pattern() { # ERE matched against an ancestor's cmdline; empty = none
+  case "$1" in
+    codex) printf '%s' '(^|[/ ])codex app-server( |$)' ;;
+    *)     printf '%s' '' ;;
+  esac
+}
+
+is_hosted() { # is_hosted <pid> <agent>
+  local p
+  p=$(hosted_pattern "$2")
+  [ -n "$p" ] && cmdline_of "$1" | grep -Eq "$p"
+}
+
 alive() { # alive <pid> <agent>: process exists and still looks like that agent
   [ -n "$1" ] && [ "$1" -gt 0 ] 2>/dev/null && [ -d "/proc/$1" ] || return 1
   cmdline_of "$1" | grep -Eq "$(agent_pattern "$2")"
@@ -51,6 +69,29 @@ alive() { # alive <pid> <agent>: process exists and still looks like that agent
 # when need_window=1, WINDOW_ADDRESS (first ancestor that owns a Hyprland
 # client, bare hex). The walk never stops early: helper processes sit above
 # the agent process, so they must be seen even when the window is cached.
+CLIENTS_FETCHED=0
+CLIENTS=""
+hypr_clients() { # "<pid> <address>" per Hyprland window, fetched once per run
+  if [ "$CLIENTS_FETCHED" = 0 ]; then
+    CLIENTS_FETCHED=1
+    CLIENTS=$(hyprctl clients -j 2>/dev/null | jq -r '.[] | "\(.pid) \(.address)"' 2>/dev/null)
+  fi
+  printf '%s' "$CLIENTS"
+}
+
+# Bare-hex address of the Hyprland window owned by <pid> or its nearest
+# ancestor; empty when none (tmux, ssh, no compositor).
+window_of() { # window_of <pid>
+  local pid="$1" clients win
+  clients=$(hypr_clients)
+  [ -n "$clients" ] || return 0
+  while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null; do
+    win=$(printf '%s\n' "$clients" | awk -v p="$pid" '$1 == p { sub(/^0x/, "", $2); print tolower($2); exit }')
+    if [ -n "$win" ]; then printf '%s' "$win"; return 0; fi
+    pid=$(awk '/^PPid:/ { print $2 }' "/proc/$pid/status" 2>/dev/null)
+  done
+}
+
 resolve_ancestry() { # resolve_ancestry <agent> <need_window:0|1>
   local agent="$1" need_window="$2" pid=$$ pattern helpers clients="" cmd
   pattern=$(agent_pattern "$agent")
@@ -59,7 +100,7 @@ resolve_ancestry() { # resolve_ancestry <agent> <need_window:0|1>
   WINDOW_ADDRESS=""
   HELPER_ANCESTOR=0
   if [ "$need_window" = 1 ]; then
-    clients=$(hyprctl clients -j 2>/dev/null | jq -r '.[] | "\(.pid) \(.address)"' 2>/dev/null)
+    clients=$(hypr_clients)
   fi
   while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null; do
     cmd=$(cmdline_of "$pid")
@@ -74,6 +115,69 @@ resolve_ancestry() { # resolve_ancestry <agent> <need_window:0|1>
     fi
     pid=$(awk '/^PPid:/ { print $2 }' "/proc/$pid/status" 2>/dev/null)
   done
+}
+
+# agentPid of every other session of <agent>, one per line.
+bound_pids() { # bound_pids <agent> <session_id>
+  local f
+  for f in "$STATE_DIR/$1"-*.json; do
+    [ -e "$f" ] || continue
+    jq -r --arg s "$2" 'select(.sessionId != $s) | (.agentPid // 0)' "$f" 2>/dev/null
+  done
+}
+
+# A hook fired inside a hosted daemon: find the frontend (TUI) process the
+# session belongs to. Sets CLIENT_PID (0 = undecided) and CLIENT_WINDOW.
+#   candidates: live agent processes that are not the daemon, preferring the
+#     ones started in the session's working directory (wrappers whose child
+#     is also a candidate are dropped);
+#   1. the candidate whose window has focus (prompts are typed there, and
+#      Codex fires SessionStart on the first prompt);
+#   2. else the only candidate not yet bound to another session;
+#   3. else the only candidate. Anything more ambiguous stays undecided
+#      rather than pinning the session to the wrong window.
+resolve_client() { # resolve_client <agent> <cwd> <session_id>
+  local agent="$1" cwd="$2" sid="$3" pattern hosted p q c pp all="" same="" cands final="" active w bound free="" nfree=0 n=0 rcwd=""
+  CLIENT_PID=0
+  CLIENT_WINDOW=""
+  pattern=$(agent_pattern "$agent")
+  hosted=$(hosted_pattern "$agent")
+  [ -n "$cwd" ] && rcwd=$(readlink -f "$cwd" 2>/dev/null)
+  while read -r p; do
+    [ -n "$p" ] && [ "$p" != $$ ] || continue
+    c=$(cmdline_of "$p")
+    [ "${c#*agent-watcher-hook}" = "$c" ] || continue
+    printf '%s' "$c" | grep -Eq "$pattern" || continue
+    [ -n "$hosted" ] && printf '%s' "$c" | grep -Eq "$hosted" && continue
+    all="$all $p"
+    if [ -n "$rcwd" ] && [ "$(readlink -f "/proc/$p/cwd" 2>/dev/null)" = "$rcwd" ]; then same="$same $p"; fi
+  done < <(pgrep -f -- "$agent" 2>/dev/null)
+  cands=${same:-$all}
+  for p in $cands; do
+    for q in $cands; do
+      pp=$(awk '/^PPid:/ { print $2 }' "/proc/$q/status" 2>/dev/null)
+      [ "$pp" = "$p" ] && continue 2
+    done
+    final="$final $p"
+  done
+  [ -n "$final" ] || return 0
+  active=$(hyprctl activewindow -j 2>/dev/null | jq -r '.address // ""' 2>/dev/null | sed 's/^0x//' | tr 'A-F' 'a-f')
+  if [ -n "$active" ]; then
+    for p in $final; do
+      w=$(window_of "$p")
+      if [ "$w" = "$active" ]; then CLIENT_PID=$p; CLIENT_WINDOW=$w; return 0; fi
+    done
+  fi
+  bound=$(bound_pids "$agent" "$sid")
+  for p in $final; do
+    n=$((n+1))
+    printf '%s\n' "$bound" | grep -qx "$p" || { free="$free $p"; nfree=$((nfree+1)); }
+  done
+  if [ "$nfree" = 1 ]; then CLIENT_PID=${free# }
+  elif [ "$n" = 1 ]; then CLIENT_PID=${final# }
+  else return 0
+  fi
+  CLIENT_WINDOW=$(window_of "$CLIENT_PID")
 }
 
 ping_shell() {
@@ -111,43 +215,78 @@ window_exists() { # window_exists <bare-hex-address>
   printf '%s\n' "$WINDOWS" | grep -qx "$1"
 }
 
+# Claude Code ends a turn without any hook when the user denies a permission
+# or presses Esc; its transcript, though, gets the interruption (or the
+# turn's closing turn_duration record) right away. True when the last
+# conversational record of <transcript> closes the turn and is newer than
+# <updatedAt> (the state file's last event, whole seconds: a record from the
+# same second is not trusted to come after it).
+turn_ended_after() { # turn_ended_after <transcript> <updatedAt>
+  [ -r "$1" ] || return 1
+  tail -n 60 "$1" 2>/dev/null | jq -cR 'fromjson? // empty' 2>/dev/null | jq -es --argjson since "${2:-0}" '
+    map(select(type == "object" and (.type == "user" or .type == "assistant"
+      or (.type == "system" and .subtype == "turn_duration")))) | last
+    | select(. != null)
+    | ((.timestamp // "") | sub("\\.[0-9]+Z$"; "Z") | (try fromdateiso8601 catch 0)) as $t
+    | $t > $since and (
+        .type == "system"
+        or (.type == "user" and ((.message.content // "")
+              | if type == "array" then map(.text? // "") | join("") else tostring end
+              | startswith("[Request interrupted by user"))))
+  ' >/dev/null 2>&1
+}
+
 dump() {
   # No jq means we cannot tell a broken state file from a good one, so prune
   # nothing: deleting every session here would lose live sessions for good.
   command -v jq >/dev/null 2>&1 || { printf '[]\n'; return 0; }
   mkdir -p "$STATE_DIR" 2>/dev/null
-  local f agent pid win out
-  local files=()
+  local f agent pid win state updated transcript out
+  local files=() ended=()
   for f in "$STATE_DIR"/*.json; do
     [ -e "$f" ] || continue
     # Unreadable or already gone (a concurrent session-end): skip, never delete.
     [ -r "$f" ] || continue
-    if ! agent=$(jq -er '.agent' "$f" 2>/dev/null); then
+    if ! agent=$(jq -er '.agent | strings' "$f" 2>/dev/null); then
       # Only delete when jq ran against a file that is still there: that is a
       # real parse failure, not a race.
       [ -e "$f" ] && rm -f "$f"
       continue
     fi
-    pid=$(jq -r '.agentPid // 0' "$f" 2>/dev/null)
+    { read -r pid; read -r win; read -r state; read -r updated; read -r transcript; } < <(
+      jq -r '((.agentPid // 0) | tostring), (.windowAddress // ""), (.state // ""),
+             ((.updatedAt // 0) | tostring), (.transcriptPath // "")' "$f" 2>/dev/null)
     if [ "${pid:-0}" -gt 0 ] 2>/dev/null && ! alive "$pid" "$agent"; then rm -f "$f"; continue; fi
     # The window it was started in is gone and no live process vouches for
     # it — either we never learned the pid, or the agent survived the hangup
     # and now hangs off init/systemd (OpenCode does that): the user closed the
     # terminal. Not a session anyone can reach any more; drop it. A tmux/nohup
     # session that never had a window keeps its empty address and is left alone.
-    win=$(jq -r '.windowAddress // ""' "$f" 2>/dev/null)
     if [ -n "$win" ] && { [ "${pid:-0}" -le 0 ] 2>/dev/null || orphaned "$pid"; } && ! window_exists "$win"; then
       rm -f "$f"; continue
     fi
     files+=("$f")
+    if [ "$agent" = claude ] && { [ "$state" = working ] || [ "$state" = waiting ]; } && [ -n "$transcript" ] &&
+       turn_ended_after "$transcript" "$updated"; then
+      ended+=("$f")
+    fi
   done
   if [ "${#files[@]}" -eq 0 ]; then printf '[]\n'; return 0; fi
-  # jq -s fails wholesale if one file vanished since the loop; fall back to
+  # Interrupted turns are reported as idle without touching the file: the
+  # next real hook event simply overrides it.
+  local ended_json fix='map(select(type == "object"))'
+  ended_json=$(jq -cn '$ARGS.positional' --args "${ended[@]}" 2>/dev/null) || ended_json='[]'
+  fix='[inputs | select(type == "object") | (input_filename) as $f
+        | if ($ended | index($f)) then .state = "idle" | .lastEvent = "interrupted" else . end]'
+  # jq fails wholesale if one file vanished since the loop; fall back to
   # reading them one by one rather than reporting "no sessions at all".
-  if out=$(jq -s 'map(select(type == "object"))' "${files[@]}" 2>/dev/null); then
+  if out=$(jq -n --argjson ended "$ended_json" "$fix" "${files[@]}" 2>/dev/null); then
     printf '%s\n' "$out"
   else
-    { for f in "${files[@]}"; do [ -r "$f" ] && jq -c . "$f" 2>/dev/null; done; } | jq -s 'map(select(type == "object"))'
+    { for f in "${files[@]}"; do
+        [ -r "$f" ] && jq -c --argjson ended "$ended_json" --arg f "$f" \
+          'select(type == "object") | if ($ended | index($f)) then .state = "idle" | .lastEvent = "interrupted" else . end' "$f" 2>/dev/null
+      done; } | jq -s '.'
   fi
 }
 
@@ -182,6 +321,9 @@ CWD=$(printf '%s' "$INPUT" | jq -r '.cwd // .directory // empty' 2>/dev/null)
 # title); other agents leave it empty and the shell falls back to the window
 # title / project name.
 TITLE=$(printf '%s' "$INPUT" | jq -r '.title // empty' 2>/dev/null)
+# Claude Code's transcript lets the dump notice turns that ended without a
+# hook (a denied permission, Esc).
+TRANSCRIPT=$(printf '%s' "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)
 
 # Gemini fires Notification for more than permissions; only ToolPermission blocks.
 if [ "$AGENT" = gemini ] && [ "$EVENT" = waiting ]; then
@@ -204,10 +346,11 @@ if [ "$EVENT" = session-end ]; then
   exit 0
 fi
 
-PREV_STATE=""; PREV_WINDOW=""; PREV_PID=0; PREV_CWD=""; PREV_TITLE=""
+PREV_STATE=""; PREV_WINDOW=""; PREV_PID=0; PREV_CWD=""; PREV_TITLE=""; PREV_TRANSCRIPT=""
 if [ -f "$FILE" ]; then
-  { read -r PREV_STATE; read -r PREV_WINDOW; read -r PREV_PID; read -r PREV_CWD; read -r PREV_TITLE; } < <(
-    jq -r '(.state // ""), (.windowAddress // ""), ((.agentPid // 0)|tostring), (.cwd // ""), (.title // "")' "$FILE" 2>/dev/null)
+  { read -r PREV_STATE; read -r PREV_WINDOW; read -r PREV_PID; read -r PREV_CWD; read -r PREV_TITLE; read -r PREV_TRANSCRIPT; } < <(
+    jq -r '(.state // ""), (.windowAddress // ""), ((.agentPid // 0)|tostring), (.cwd // "" | gsub("\n"; " ")),
+           (.title // "" | gsub("\n"; " ")), (.transcriptPath // "")' "$FILE" 2>/dev/null)
 fi
 # rename touches only the title: state, timestamps and lastEvent stay put so
 # the shell does not mistake it for new activity (which would re-arm a blink
@@ -225,6 +368,10 @@ if [ "$EVENT" = rename ]; then
 fi
 # tool-done only matters while blocked on a permission.
 if [ "$EVENT" = tool-done ] && [ "$PREV_STATE" != waiting ]; then exit 0; fi
+[ -n "$CWD" ] || CWD="$PREV_CWD"
+[ -n "$TITLE" ] || TITLE="$PREV_TITLE"
+[ -n "$TRANSCRIPT" ] || TRANSCRIPT="$PREV_TRANSCRIPT"
+case $PREV_PID in ''|*[!0-9]*) PREV_PID=0 ;; esac
 
 # The window is resolved once per session (hyprctl is the expensive part).
 if [ -n "$PREV_WINDOW" ]; then
@@ -239,19 +386,52 @@ if [ "${HELPER_ANCESTOR:-0}" = 1 ]; then
   rm -f "$FILE"
   exit 0
 fi
-[ "$AGENT_PID" != 0 ] || AGENT_PID="${PREV_PID:-0}"
+# Fired from a shared daemon: the parent chain says nothing about this
+# session's terminal. Keep the frontend found earlier while it lives,
+# otherwise look for it; undecided sessions keep the daemon's pid (so they
+# still vanish with it) and no window.
+if [ "$AGENT_PID" != 0 ] && is_hosted "$AGENT_PID" "$AGENT"; then
+  if [ "$PREV_PID" != 0 ] && ! is_hosted "$PREV_PID" "$AGENT" && alive "$PREV_PID" "$AGENT"; then
+    AGENT_PID=$PREV_PID
+    WINDOW_ADDRESS="$PREV_WINDOW"
+  else
+    resolve_client "$AGENT" "$CWD" "$SESSION_ID"
+    if [ "$CLIENT_PID" != 0 ]; then
+      AGENT_PID=$CLIENT_PID
+      WINDOW_ADDRESS="$CLIENT_WINDOW"
+    else
+      WINDOW_ADDRESS=""
+    fi
+  fi
+fi
+[ "$AGENT_PID" != 0 ] || AGENT_PID="$PREV_PID"
 case $AGENT_PID in ''|*[!0-9]*) AGENT_PID=0 ;; esac
-[ -n "$CWD" ] || CWD="$PREV_CWD"
-[ -n "$TITLE" ] || TITLE="$PREV_TITLE"
+
+if [ "$EVENT" = session-start ]; then
+  # Same process, same session: a resume or a context compaction (Claude Code
+  # fires SessionStart again, possibly mid-turn). Nothing new to report, and
+  # rewriting the file would reset a working/done state to idle.
+  if [ -n "$PREV_STATE" ] && [ "$AGENT_PID" != 0 ] && [ "$AGENT_PID" = "$PREV_PID" ]; then exit 0; fi
+  # A new session in a process that already had one (/clear, /new, /resume):
+  # one terminal shows one conversation, so the old one is gone from view.
+  # OpenCode is excluded: one process serves several sessions side by side.
+  if [ "$AGENT" != opencode ] && [ "$AGENT_PID" != 0 ] && ! is_hosted "$AGENT_PID" "$AGENT"; then
+    for f in "$STATE_DIR/$AGENT"-*.json; do
+      [ -e "$f" ] && [ "$f" != "$FILE" ] || continue
+      [ "$(jq -r '.agentPid // 0' "$f" 2>/dev/null)" = "$AGENT_PID" ] && rm -f "$f"
+    done
+  fi
+fi
 
 mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
 NOW=$(date +%s)
 TMP="$FILE.tmp.$$"
 if jq -n --arg agent "$AGENT" --arg sessionId "$SESSION_ID" --arg state "$STATE" --arg cwd "$CWD" \
       --argjson agentPid "${AGENT_PID:-0}" --arg windowAddress "$WINDOW_ADDRESS" \
-      --argjson updatedAt "$NOW" --arg lastEvent "$EVENT" --arg title "$TITLE" \
+      --argjson updatedAt "$NOW" --arg lastEvent "$EVENT" --arg title "$TITLE" --arg transcriptPath "$TRANSCRIPT" \
       '{agent: $agent, sessionId: $sessionId, state: $state, cwd: $cwd, agentPid: $agentPid,
-        windowAddress: $windowAddress, updatedAt: $updatedAt, lastEvent: $lastEvent, title: $title}' > "$TMP" 2>/dev/null; then
+        windowAddress: $windowAddress, updatedAt: $updatedAt, lastEvent: $lastEvent, title: $title,
+        transcriptPath: $transcriptPath}' > "$TMP" 2>/dev/null; then
   mv -f "$TMP" "$FILE" 2>/dev/null
 fi
 rm -f "$TMP" 2>/dev/null

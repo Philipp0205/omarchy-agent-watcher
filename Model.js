@@ -90,7 +90,13 @@ function normalizeSession(raw) {
     lastEvent: trimString(raw.lastEvent),
     title: trimString(raw.title),
     seen: false,
-    stateSince: 0
+    stateSince: 0,
+    // Window-title bookkeeping (see reconcileTitles), shell-side only.
+    titleBusySeen: false,
+    titleWaitSeen: false,
+    titlePending: "",
+    titleSince: 0,
+    titleOverride: ""
   }
 }
 
@@ -153,15 +159,29 @@ function informativeTitle(title, agent) {
   if (TERMINAL_NAMES.indexOf(lower) !== -1) return ""
   if (/^[^\s@]+@[^\s:]+:/.test(t)) return ""      // user@host: prompt titles
   if (/^(~|\/)/.test(t)) return ""                   // path-like titles
+  // Status-only titles: Gemini CLI's "Ready (proj)" / "Action Required (proj)";
+  // Codex's "[ ! ] Action Required | …" prefix (the row shows the state).
+  if (/^(ready|action required)\s*\(.*\)$/i.test(t)) return ""
+  t = trimString(t.replace(/^\[\s*[.!]\s*\]\s*action required\s*(\|\s*)?/i, ""))
   return t
 }
+
+// OpenCode names a session "New session - <ISO date>" (sub-agents "Child
+// session - …") until it has generated a real title, which may never happen
+// for short sessions.
+var PLACEHOLDER_TITLE = /^(new|child) session - \d{4}-\d{2}-\d{2}t[\d:.]+z?$/i
 
 // Primary row label: the agent-supplied session name (OpenCode) beats the
 // live window title (Claude Code writes its task summary there), which beats
 // the project folder.
 function sessionLabel(session, windowTitle, home) {
-  if (session.title && trimString(session.title) !== "") return trimString(session.title)
+  var own = trimString(session.title)
+  if (own !== "" && !PLACEHOLDER_TITLE.test(own)) return own
   var t = informativeTitle(windowTitle, session.agent)
+  // Codex titles read "<thread name> | <project>"; the project is already on
+  // the path line underneath.
+  var suffix = " | " + projectName(session.cwd)
+  if (t.length > suffix.length && t.slice(-suffix.length) === suffix) t = trimString(t.slice(0, -suffix.length))
   if (t !== "") return t
   // A session started in $HOME would otherwise be labelled with the username.
   if (collapseHome(session.cwd, home) === "~") return "~"
@@ -233,6 +253,11 @@ function mergeSessions(prevMap, snapshot, activeAddress, nowSec) {
     if (isSameEvent(old, s)) {
       next.seen = old.seen
       next.stateSince = old.stateSince
+      next.titleBusySeen = old.titleBusySeen === true
+      next.titleWaitSeen = old.titleWaitSeen === true
+      next.titlePending = old.titlePending || ""
+      next.titleSince = old.titleSince || 0
+      next.titleOverride = old.titleOverride || ""
     } else {
       var focused = s.windowAddress !== "" && s.windowAddress === active
       next.seen = focused || s.state === "working" || s.state === "idle"
@@ -266,15 +291,108 @@ function sessionList(map) {
   return out
 }
 
+// ---- Window titles as a liveness signal.
+// Some turns change state without any hook: Claude Code and Codex fire
+// nothing when the user presses Esc or denies a permission, an API error ends
+// a Claude turn without Stop, and an approved permission only reports back
+// once the tool has finished. The terminal title the agent maintains does
+// tell: Claude Code prefixes it with a spinning ◐◓◑◒ while working and ✳
+// otherwise; Codex with a braille spinner, and "[ ! ] Action Required" while
+// it waits for an approval; Gemini CLI shows "✋  Action Required" and
+// "◇  Ready". When the title has disagreed with the hook state for
+// TITLE_GRACE_SEC (and the last hook event is that old too), the title wins
+// until the next real event:
+//   working + idle title   -> idle    (interrupted)
+//   waiting + busy title   -> working (approved, the tool is running)
+//   waiting + idle title   -> idle    (denied; only agents with a waiting marker)
+var TITLE_GRACE_SEC = 4
+var TITLE_MARKERS = {
+  // definite: the idle marker can only come from the agent itself. Otherwise
+  // the agent must first have been seen showing the marker of the current
+  // state, so a shell or terminal title is never mistaken for "idle".
+  claude: { busy: /^\s*[◐-◓]/, waiting: null, idle: /^\s*✳/, definite: true },
+  codex: { busy: /^\s*[⠀-⣿]/, waiting: /^\s*\[\s*[.!]\s*\]\s*Action Required/i, idle: /^\s*\S/, definite: false },
+  gemini: { busy: null, waiting: /^\s*✋/, idle: /^\s*◇/, definite: true }
+}
+
+function titleActivity(agent, title) {
+  var m = TITLE_MARKERS[agent]
+  var t = String(title === undefined || title === null ? "" : title)
+  if (!m || trimString(t) === "") return ""
+  if (m.busy && m.busy.test(t)) return "busy"
+  if (m.waiting && m.waiting.test(t)) return "waiting"
+  if (m.idle && m.idle.test(t)) return "idle"
+  return ""
+}
+
+// The state the title argues for, or "" when it agrees / proves nothing.
+// Mutates `track` (busySeen / waitSeen) as markers are observed.
+function titleCandidate(s, act, track) {
+  var m = TITLE_MARKERS[s.agent]
+  if (!m) return ""
+  if (s.state === "working") {
+    if (act === "busy") track.busySeen = true
+    else if (act === "idle" && (m.definite || track.busySeen)) return "idle"
+  } else if (s.state === "waiting") {
+    if (act === "waiting") track.waitSeen = true
+    else if (act === "busy") return "working"
+    else if (act === "idle" && m.waiting && (m.definite || track.waitSeen)) return "idle"
+  }
+  return ""
+}
+
+// `titles` maps a bare window address to its live title. Returns `map`
+// itself when nothing changed, so QML bindings do not churn.
+function reconcileTitles(map, titles, nowSec) {
+  var table = titles || {}
+  var now = nowSec || 0
+  var out = {}
+  var changed = false
+  for (var key in map) {
+    var s = map[key]
+    var track = { busySeen: s.titleBusySeen === true, waitSeen: s.titleWaitSeen === true }
+    var pending = "", since = 0, override = ""
+    if (s.windowAddress !== "" && table[s.windowAddress] !== undefined) {
+      var cand = titleCandidate(s, titleActivity(s.agent, table[s.windowAddress]), track)
+      if (cand !== "") {
+        pending = cand
+        since = s.titlePending === cand && s.titleSince ? s.titleSince : now
+        if (now - since >= TITLE_GRACE_SEC && now - (s.updatedAt || 0) >= TITLE_GRACE_SEC) override = cand
+      }
+    }
+    if (track.busySeen !== (s.titleBusySeen === true) || track.waitSeen !== (s.titleWaitSeen === true) ||
+        pending !== (s.titlePending || "") || since !== (s.titleSince || 0) || override !== (s.titleOverride || "")) {
+      var copy = copySession(s)
+      copy.titleBusySeen = track.busySeen
+      copy.titleWaitSeen = track.waitSeen
+      copy.titlePending = pending
+      copy.titleSince = since
+      copy.titleOverride = override
+      out[key] = copy
+      changed = true
+    } else {
+      out[key] = s
+    }
+  }
+  return changed ? out : map
+}
+
+// The hook state, corrected by the window title when they disagree.
+function effectiveState(session) {
+  return session.titleOverride ? session.titleOverride : session.state
+}
+
 function displayState(session) {
-  return session.state === "done" && session.seen ? "idle" : session.state
+  var st = effectiveState(session)
+  return st === "done" && session.seen ? "idle" : st
 }
 
 function needsAttention(session, settings) {
   var opts = settings || {}
   if (session.seen) return false
-  if (session.state === "done") return boolSetting(opts.blinkOnDone, true)
-  if (session.state === "waiting") return boolSetting(opts.blinkOnWaiting, true)
+  var st = effectiveState(session)
+  if (st === "done") return boolSetting(opts.blinkOnDone, true)
+  if (st === "waiting") return boolSetting(opts.blinkOnWaiting, true)
   return false
 }
 
@@ -282,9 +400,9 @@ function barSummary(list, settings) {
   var working = 0, waiting = 0, done = 0
   for (var i = 0; i < list.length; i++) {
     var s = list[i]
-    if (s.state === "working") working++
+    if (effectiveState(s) === "working") working++
     if (needsAttention(s, settings)) {
-      if (s.state === "waiting") waiting++
+      if (effectiveState(s) === "waiting") waiting++
       else done++
     }
   }
@@ -422,6 +540,10 @@ if (typeof module !== "undefined") {
     informativeTitle: informativeTitle,
     sessionLabel: sessionLabel,
     sessionSubtitle: sessionSubtitle,
+    TITLE_GRACE_SEC: TITLE_GRACE_SEC,
+    titleActivity: titleActivity,
+    reconcileTitles: reconcileTitles,
+    effectiveState: effectiveState,
     cleanTitle: cleanTitle,
     formatElapsed: formatElapsed,
     normalizeColor: normalizeColor,
