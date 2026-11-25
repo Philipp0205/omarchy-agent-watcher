@@ -120,7 +120,7 @@ a window — click-to-focus works on both generations.
   `SessionStart`). Two Codex TUIs started in the same directory are told apart
   by focus; until you type in one, a new session there is listed without a
   window.
-- OpenCode 2.x is supported through a TUI plugin (`hooks/opencode-agent-watcher-tui.js`): the setup script writes it to `~/.config/opencode/plugins/agent-watcher-tui/` and lists that directory in `~/.config/opencode/cli.json`. Server plugins run in a shared background service with no terminal window above them, so on 2.x only the TUI plugin reports. OpenCode 1.x keeps the server plugin. Restart OpenCode after switching the hooks on.
+- OpenCode 2.x is supported through a TUI plugin (`hooks/opencode-agent-watcher-tui.js`): the setup script writes it to `~/.config/opencode/plugins/agent-watcher-tui/` (OpenCode 2 discovers `plugins/*/tui.js` by itself, so `cli.json` is not touched). Server plugins run in a shared background service with no terminal window above them, so on 2.x only the TUI plugin reports. OpenCode 1.x keeps the server plugin. Restart OpenCode after switching the hooks on.
 - OpenCode sessions keep their own name only once OpenCode has generated one;
   until then (and for short sessions it never does) the project folder is
   shown.

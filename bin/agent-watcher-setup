@@ -154,7 +154,7 @@ status_of() {
 
 opencode_is_v2() { local v; v=$(opencode --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1); [ "${v%%.*}" -ge 2 ] 2>/dev/null; }
 
-# cli_json_edit add|remove: list/unlist the TUI plugin dir in OpenCode's cli.json
+# cli_json_edit add|remove: list/unlist the TUI plugin dir in OpenCode's cli.json (only `remove` is used)
 cli_json_edit() {
   local f tmp
   f=$(real_target "$OPENCODE_CLI_JSON")
@@ -180,7 +180,7 @@ install_agent() {
         # window above them, so only the TUI plugin can report.
         mkdir -p "$OPENCODE_TUI_DIR" || die "cannot create $OPENCODE_TUI_DIR"
         sed "s|__HOOK_PATH__|$HOOK|g" "$TUI_TEMPLATE" > "$OPENCODE_TUI_DIR/tui.js" || die "could not write tui.js"
-        cli_json_edit add
+        cli_json_edit remove # 2.x discovers plugins/*/tui.js itself; drop any earlier explicit entry
       else
         mkdir -p "$(dirname "$OPENCODE_PLUGIN")" || die "cannot create $(dirname "$OPENCODE_PLUGIN")"
         backup "$OPENCODE_PLUGIN"

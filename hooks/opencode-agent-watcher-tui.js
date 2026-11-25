@@ -41,90 +41,64 @@ function send(event, sessionId, cwd, title) {
     .catch(() => {})
 }
 
-async function tui(api) {
-  const dirs = new Map() // root session id -> directory
-  const titles = new Map() // root session id -> title
-  const children = new Set() // sub-agent sessions: ignored
-  const busy = new Set()
-  const cwdOf = (id) => dirs.get(id) || process.cwd()
-  const titleOf = (id) => titles.get(id) || ""
-  const report = (ev, id) => send(ev, id, cwdOf(id), titleOf(id))
+// OpenCode 2 TUI plugins export { id, setup }; setup(api) returns a disposer.
+// Events arrive through api.data.listen as { details: { type, data } }.
+function setup(api) {
+  const known = new Map() // root session id -> last reported title
+  const cwdOf = (id) => api.data.session.get(id)?.directory || process.cwd()
+  const isChild = (id) => !!api.data.session.get(id)?.parentID
+  const report = (ev, id) => send(ev, id, cwdOf(id), known.get(id) || "")
 
-  const handlers = {
-    "session.created": (p) => {
-      if (!p.info) return
-      if (p.info.parentID) return void children.add(p.info.id)
-      dirs.set(p.info.id, p.info.directory || process.cwd())
-      titles.set(p.info.id, p.info.title || "")
-      report("session-start", p.info.id)
-    },
-    "session.updated": (p) => {
-      if (!p.info || children.has(p.info.id)) return
-      if (p.info.parentID) return void children.add(p.info.id)
-      if (!dirs.has(p.info.id)) dirs.set(p.info.id, p.info.directory || process.cwd())
-      if ((p.info.title || "") !== titleOf(p.info.id)) {
-        titles.set(p.info.id, p.info.title || "")
-        report("rename", p.info.id)
-      }
-    },
-    "session.status": (p) => {
-      if (children.has(p.sessionID)) return
-      if (p.status?.type === "busy") {
-        if (busy.has(p.sessionID)) return
-        busy.add(p.sessionID)
-        report("prompt", p.sessionID)
-      } else if (p.status?.type === "idle") {
-        busy.delete(p.sessionID)
-        report("done", p.sessionID)
-      }
-    },
-    "session.idle": (p) => {
-      busy.delete(p.sessionID)
-      if (!children.has(p.sessionID)) report("done", p.sessionID)
-    },
-    "permission.asked": (p) => {
-      if (!children.has(p.sessionID)) report("waiting", p.sessionID)
-    },
-    "question.asked": (p) => {
-      if (!children.has(p.sessionID)) report("waiting", p.sessionID)
-    },
-    "permission.replied": (p) => {
-      if (!children.has(p.sessionID)) report("tool-done", p.sessionID)
-    },
-    "question.replied": (p) => {
-      if (!children.has(p.sessionID)) report("tool-done", p.sessionID)
-    },
-    "session.deleted": (p) => {
-      if (!p.info || children.has(p.info.id)) return
-      send("session-end", p.info.id, cwdOf(p.info.id))
-      dirs.delete(p.info.id)
-      titles.delete(p.info.id)
-      busy.delete(p.info.id)
-    },
-  }
-
-  const off = Object.entries(handlers).map(([type, fn]) =>
-    api.event.on(type, (event) => {
-      try {
-        fn(event?.properties || {})
-      } catch {}
-    }),
-  )
-  api.lifecycle.onDispose(() => {
-    for (const unsubscribe of off) unsubscribe()
-  })
-
-  // Sessions already open when the TUI starts: register the one on screen.
-  const route = api.route.current
-  if (route?.name === "session" && route.params?.sessionID) {
-    const id = route.params.sessionID
-    const s = api.state?.session?.get?.(id)
-    if (s && !s.parentID) {
-      dirs.set(id, s.directory || process.cwd())
-      titles.set(id, s.title || "")
+  // Register a root session the first time we see it, and pass on renames.
+  function track(id) {
+    if (typeof id !== "string" || isChild(id)) return false
+    const title = api.data.session.get(id)?.title || ""
+    if (!known.has(id)) {
+      known.set(id, title)
       report("session-start", id)
+    } else if (known.get(id) !== title) {
+      known.set(id, title)
+      report("rename", id)
     }
+    return true
   }
+
+  const unsubscribe = api.data.listen(({ details: event }) => {
+    try {
+      const data = event?.data
+      if (data == null) return
+      if (event.type === "session.deleted") {
+        if (known.delete(data.sessionID)) send("session-end", data.sessionID, process.cwd())
+        return
+      }
+      const id = event.type === "form.created" ? data.form?.sessionID : data.sessionID
+      if (!track(id)) return
+      switch (event.type) {
+        case "session.execution.started":
+          report("prompt", id)
+          break
+        case "session.execution.succeeded":
+        case "session.execution.interrupted":
+          report("done", id)
+          break
+        case "session.execution.failed":
+          report("waiting", id)
+          break
+        case "permission.asked":
+        case "form.created":
+          report("waiting", id)
+          break
+        case "permission.replied":
+        case "form.replied":
+        case "form.cancelled":
+          report("tool-done", id)
+          break
+        default:
+          break
+      }
+    } catch {}
+  })
+  return () => unsubscribe()
 }
 
-export default { id: "agent-watcher.opencode", tui }
+export default { id: "agent-watcher.opencode", setup }
