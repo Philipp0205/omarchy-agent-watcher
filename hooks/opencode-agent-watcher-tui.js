@@ -45,14 +45,33 @@ function send(event, sessionId, cwd, title) {
 // Events arrive through api.data.listen as { details: { type, data } }.
 function setup(api) {
   const known = new Map() // root session id -> last reported title
+  const children = new Set() // sub-agent sessions: never reported
+  const waiting = new Map() // unresolved session id -> retries left
   const cwdOf = (id) => api.data.session.get(id)?.directory || process.cwd()
-  const isChild = (id) => !!api.data.session.get(id)?.parentID
   const report = (ev, id) => send(ev, id, cwdOf(id), known.get(id) || "")
 
-  // Register a root session the first time we see it, and pass on renames.
+  // A session's first events can arrive before OpenCode has registered it (and
+  // its parentID), so an unknown session is not assumed to be a root: retry
+  // shortly, and only report once it is known not to have a parent.
   function track(id) {
-    if (typeof id !== "string" || isChild(id)) return false
-    const title = api.data.session.get(id)?.title || ""
+    if (typeof id !== "string" || children.has(id)) return false
+    const info = api.data.session.get(id)
+    if (!info) {
+      const left = waiting.has(id) ? waiting.get(id) : 10
+      if (left > 0) {
+        waiting.set(id, left - 1)
+        if (left === 10) {
+          const t = setTimeout(() => { waiting.delete(id) }, 6000)
+          if (t.unref) t.unref()
+        }
+      }
+      return false
+    }
+    if (info.parentID) {
+      children.add(id)
+      return false
+    }
+    const title = info.title || ""
     if (!known.has(id)) {
       known.set(id, title)
       report("session-start", id)
@@ -68,6 +87,7 @@ function setup(api) {
       const data = event?.data
       if (data == null) return
       if (event.type === "session.deleted") {
+        children.delete(data.sessionID)
         if (known.delete(data.sessionID)) send("session-end", data.sessionID, process.cwd())
         return
       }
