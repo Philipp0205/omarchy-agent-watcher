@@ -21,6 +21,10 @@ CLAUDE_SETTINGS="${AGENT_WATCHER_CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
 CODEX_HOOKS="${AGENT_WATCHER_CODEX_HOOKS:-$HOME/.codex/hooks.json}"
 GEMINI_SETTINGS="${AGENT_WATCHER_GEMINI_SETTINGS:-$HOME/.gemini/settings.json}"
 OPENCODE_PLUGIN="${AGENT_WATCHER_OPENCODE_PLUGIN:-$HOME/.config/opencode/plugins/agent-watcher.js}"
+# OpenCode 2.x: a TUI plugin directory listed in cli.json
+TUI_TEMPLATE="$(dirname "$HERE")/hooks/opencode-agent-watcher-tui.js"
+OPENCODE_TUI_DIR="${AGENT_WATCHER_OPENCODE_TUI_DIR:-$HOME/.config/opencode/plugins/agent-watcher-tui}"
+OPENCODE_CLI_JSON="${AGENT_WATCHER_OPENCODE_CLI_JSON:-$HOME/.config/opencode/cli.json}"
 
 die() { echo "error: $*" >&2; exit 1; }
 usage() { echo "usage: agent-watcher-setup status <agent|all> | install <agent> | remove <agent>" >&2; exit 2; }
@@ -137,7 +141,9 @@ status_of() {
   local agent="$1" installed=1
   case "$agent" in
     claude|codex|gemini) has_hooks "$(config_file "$agent")" && installed=0 ;;
-    opencode) [ -f "$OPENCODE_PLUGIN" ] && grep -q "$MARK" "$OPENCODE_PLUGIN" 2>/dev/null && installed=0 ;;
+    opencode)
+      { [ -f "$OPENCODE_PLUGIN" ] && grep -q "$MARK" "$OPENCODE_PLUGIN" 2>/dev/null; } && installed=0
+      { [ -f "$OPENCODE_TUI_DIR/tui.js" ] && grep -q "$MARK" "$OPENCODE_TUI_DIR/tui.js" 2>/dev/null; } && installed=0 ;;
     *) return 1 ;;
   esac
   if [ "$installed" = 0 ]; then printf 'installed'
@@ -146,14 +152,40 @@ status_of() {
   fi
 }
 
+opencode_is_v2() { local v; v=$(opencode --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1); [ "${v%%.*}" -ge 2 ] 2>/dev/null; }
+
+# cli_json_edit add|remove: list/unlist the TUI plugin dir in OpenCode's cli.json (only `remove` is used)
+cli_json_edit() {
+  local f tmp
+  f=$(real_target "$OPENCODE_CLI_JSON")
+  if [ "$1" = add ]; then
+    [ -f "$f" ] || { mkdir -p "$(dirname "$f")"; echo '{}' > "$f"; }
+  else
+    [ -f "$f" ] || return 0
+  fi
+  backup "$f"
+  tmp=$(mktemp) || return 1
+  jq --arg d "$OPENCODE_TUI_DIR" --arg op "$1" '
+    .plugins = ((.plugins // []) | map(select(. != $d)) | if $op == "add" then . + [$d] else . end)' "$f" > "$tmp" \
+    && { chmod --reference="$f" "$tmp" 2>/dev/null; mv -f "$tmp" "$f"; } || { rm -f "$tmp"; die "could not update $f"; }
+}
+
 install_agent() {
   case "$1" in
     claude|codex|gemini) merge_hooks "$(config_file "$1")" "$(hook_groups "$1")" || die "could not update $(config_file "$1")" ;;
     opencode)
-      [ -f "$TEMPLATE" ] || die "missing template $TEMPLATE"
-      mkdir -p "$(dirname "$OPENCODE_PLUGIN")" || die "cannot create $(dirname "$OPENCODE_PLUGIN")"
-      backup "$OPENCODE_PLUGIN"
-      sed "s|__HOOK_PATH__|$HOOK|g" "$TEMPLATE" > "$OPENCODE_PLUGIN" || die "could not write $OPENCODE_PLUGIN" ;;
+      [ -f "$TEMPLATE" ] && [ -f "$TUI_TEMPLATE" ] || die "missing opencode templates"
+      if opencode_is_v2; then
+        # 2.x runs server plugins in a background service with no terminal
+        # window above them, so only the TUI plugin can report.
+        mkdir -p "$OPENCODE_TUI_DIR" || die "cannot create $OPENCODE_TUI_DIR"
+        sed "s|__HOOK_PATH__|$HOOK|g" "$TUI_TEMPLATE" > "$OPENCODE_TUI_DIR/tui.js" || die "could not write tui.js"
+        cli_json_edit remove # 2.x discovers plugins/*/tui.js itself; drop any earlier explicit entry
+      else
+        mkdir -p "$(dirname "$OPENCODE_PLUGIN")" || die "cannot create $(dirname "$OPENCODE_PLUGIN")"
+        backup "$OPENCODE_PLUGIN"
+        sed "s|__HOOK_PATH__|$HOOK|g" "$TEMPLATE" > "$OPENCODE_PLUGIN" || die "could not write $OPENCODE_PLUGIN"
+      fi ;;
     *) usage ;;
   esac
   [ "$1" = codex ] && echo "note: run /hooks inside Codex once to trust the new hooks"
@@ -163,7 +195,9 @@ install_agent() {
 remove_agent() {
   case "$1" in
     claude|codex|gemini) remove_hooks "$(config_file "$1")" || die "could not update $(config_file "$1")" ;;
-    opencode) backup "$OPENCODE_PLUGIN"; rm -f "$OPENCODE_PLUGIN" ;;
+    opencode)
+      backup "$OPENCODE_PLUGIN"; rm -f "$OPENCODE_PLUGIN"
+      cli_json_edit remove; rm -rf "$OPENCODE_TUI_DIR" ;;
     *) usage ;;
   esac
 }

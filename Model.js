@@ -177,7 +177,8 @@ var PLACEHOLDER_TITLE = /^(new|child) session - \d{4}-\d{2}-\d{2}t[\d:.]+z?$/i
 function sessionLabel(session, windowTitle, home) {
   var own = trimString(session.title)
   if (own !== "" && !PLACEHOLDER_TITLE.test(own)) return own
-  var t = informativeTitle(windowTitle, session.agent)
+  // OpenCode runs many sessions per window, so the window title is not theirs.
+  var t = session.agent === "opencode" ? "" : informativeTitle(windowTitle, session.agent)
   // Codex titles read "<thread name> | <project>"; the project is already on
   // the path line underneath.
   var suffix = " | " + projectName(session.cwd)

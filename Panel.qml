@@ -87,6 +87,35 @@ Panel {
     }
   }
 
+  // ---- Keyboard selection. Rows are walked in on-screen order; the selection
+  // is remembered by session key so it survives re-sorts and refreshes.
+  readonly property var flatSessions: {
+    var out = []
+    for (var i = 0; i < groups.length; i++)
+      for (var j = 0; j < groups[i].sessions.length; j++) out.push(groups[i].sessions[j])
+    return out
+  }
+  property string selectedKey: ""
+  readonly property int selectedIndex: {
+    for (var i = 0; i < flatSessions.length; i++)
+      if (flatSessions[i].key === selectedKey) return i
+    return flatSessions.length > 0 ? 0 : -1
+  }
+  readonly property string effectiveKey: selectedIndex >= 0 ? flatSessions[selectedIndex].key : ""
+
+  function moveSelection(dy) {
+    var n = flatSessions.length
+    if (n === 0) return
+    var next = Math.max(0, Math.min(n - 1, selectedIndex + dy))
+    selectedKey = flatSessions[next].key
+  }
+
+  function activateSelection() {
+    if (selectedIndex < 0) return
+    var s = flatSessions[selectedIndex]
+    if (s.windowAddress !== "") root.focusRow(s)
+  }
+
   // Recompute both derived collections; called on open, on the 1 s tick
   // while open, and whenever their real inputs change.
   function refreshDerived() {
@@ -162,6 +191,7 @@ Panel {
     // elapsed time.
     root.nowSec = Math.floor(Date.now() / 1000)
     root.tick++
+    root.selectedKey = ""
     root.refreshDerived()
     root.controller.show()
     refreshHookStatus()
@@ -237,7 +267,9 @@ Panel {
       id: keyCatcher
       anchors.fill: parent
       onCloseRequested: root.close()
-      onReturnRequested: if (root.host) root.host.requestDump()
+      onMoveRequested: function(dx, dy) { if (dy !== 0) root.moveSelection(dy) }
+      onActivateRequested: root.activateSelection()
+      onTextKey: function(t, modifiers) { if (t === "r" && root.host) root.host.requestDump() }
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
       Column {
@@ -333,6 +365,7 @@ Panel {
                 id: row
                 required property var modelData
                 readonly property bool attention: Model.needsAttention(modelData, root.blinkSettings)
+                readonly property bool selected: root.effectiveKey === modelData.key
                 readonly property bool focusable: modelData.windowAddress !== ""
                 readonly property string shownState: Model.displayState(modelData)
                 readonly property color tone: root.stateColor(modelData)
@@ -344,10 +377,20 @@ Panel {
                 Rectangle {
                   anchors.fill: parent
                   radius: Style.cornerRadius
-                  color: rowMouse.containsMouse && row.focusable
+                  color: (rowMouse.containsMouse || row.selected) && row.focusable
                     ? Style.hoverFillFor(root.barForeground, root.accentColor)
                     : (row.attention ? Style.selectedFillFor(root.barForeground, root.accentColor) : root.alpha(root.barForeground, 0.05))
                   Behavior on color { ColorAnimation { duration: 120 } }
+                }
+
+                // Keyboard selection ring.
+                Rectangle {
+                  visible: row.selected
+                  anchors.fill: parent
+                  radius: Style.cornerRadius
+                  color: "transparent"
+                  border.width: 2
+                  border.color: root.accentColor
                 }
 
                 // Colored edge on the rows that need attention.
@@ -665,7 +708,7 @@ Panel {
           leftPadding: Style.space(2)
           rightPadding: Style.space(2)
           wrapMode: Text.WordWrap
-          text: "Click a session to focus its window · Middle-click the pill to refresh · Remove hooks here before uninstalling the plugin"
+          text: "↑/↓ or j/k to select · Enter to focus · r to refresh · Click a session to focus its window · Middle-click the pill to refresh · Remove hooks here before uninstalling the plugin"
           color: root.dimForeground
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
